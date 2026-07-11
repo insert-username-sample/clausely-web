@@ -137,6 +137,15 @@ Enrollment: MAH/1234/2026`
   // Export dropdown state
   const [showExportDropdown, setShowExportDropdown] = useState(false);
 
+  // Matter/Case Setup Modal States
+  const [showSetupModal, setShowSetupModal] = useState(false);
+  const [pendingPrompt, setPendingPrompt] = useState("");
+  const [isNewMatter, setIsNewMatter] = useState(true);
+  const [newMatterName, setNewMatterName] = useState("");
+  const [linkedMatter, setLinkedMatter] = useState("ABC Corp vs State of Maharashtra");
+  const [partyA, setPartyA] = useState("");
+  const [partyB, setPartyB] = useState("");
+
   // AI Floating Input state
   const [aiPrompt, setAiPrompt] = useState("");
   const [isDrafting, setIsDrafting] = useState(false);
@@ -321,9 +330,31 @@ Enrollment: MAH/1234/2026`
     };
   });
 
-  const sendCopilotMessage = async (message: string) => {
+  const sendCopilotMessage = async (message: string, bypassModal: boolean = false) => {
     const cleanMessage = message.trim();
     if (!cleanMessage || isChatSending) return;
+
+    // Detect draft / creation intents (including terms like 'nda', 'agreement', 'writ')
+    const isDraftIntent = /\b(?:create|draft|generate|prepare|write|make|nda|contract|agreement|petition)\b/i.test(cleanMessage);
+
+    if (isDraftIntent && !bypassModal) {
+      setPendingPrompt(cleanMessage);
+      const ndaMatch = /\bnda\b/i.test(cleanMessage);
+      const petitionMatch = /\b(?:petition|writ)\b/i.test(cleanMessage);
+      
+      if (ndaMatch) {
+        setNewMatterName("NDA Drafting Workspace");
+      } else if (petitionMatch) {
+        setNewMatterName("Writ Petition Workspace");
+      } else {
+        setNewMatterName("Clausely Drafting Project");
+      }
+      
+      setPartyA("");
+      setPartyB("");
+      setShowSetupModal(true);
+      return;
+    }
 
     const outgoing = { sender: "user", text: cleanMessage };
     setChatMessages(prev => [...prev, outgoing]);
@@ -331,7 +362,6 @@ Enrollment: MAH/1234/2026`
     setIsChatSending(true);
 
     try {
-      const isDraftIntent = /\b(?:create|draft|generate|prepare|write|make)\b.*\b(?:doc|document|petition|agreement|contract|pleading|affidavit|statement|notice|application|reply)\b/i.test(cleanMessage);
       const result = await runClauselyAgent({
         input: cleanMessage,
         surface: "drafting_studio",
@@ -346,9 +376,22 @@ Enrollment: MAH/1234/2026`
         },
       });
 
-      const generatedDocument = result.committedArtifacts.find(artifact => artifact.type === "document")?.text;
+      const generatedDocument = result.committedArtifacts.find(
+        artifact => artifact.type === "document" || artifact.type === "chat_response"
+      )?.text;
+
       if (generatedDocument) {
-        const parts = generatedDocument.split(/\n\s*\n(?=(?:The material facts|The grounds|The applicant therefore|IN THE))/i);
+        let parts: string[] = [];
+        if (generatedDocument.includes("---PAGE_BREAK---")) {
+          parts = generatedDocument.split("---PAGE_BREAK---");
+        } else {
+          // Robust logical splitter for NDAs, agreements, contracts, and petitions
+          parts = generatedDocument.split(/\n\s*\n(?=(?:ARTICLE|SECTION|CLAUSE|WHEREAS|IN WITNESS|NOW THEREFORE|PRAYER|VERIFICATION|PETITION|PETITIONER|RESPONDENT|In the matter of|Petitioner respectfully submits))/i);
+          if (parts.length <= 1) {
+            parts = generatedDocument.split("\n\n");
+          }
+        }
+
         setPages(parts.map((txt: string, idx: number) => ({
           id: `page-${idx}-${Date.now()}`,
           initialText: txt.trim()
@@ -376,6 +419,31 @@ Enrollment: MAH/1234/2026`
     } finally {
       setIsChatSending(false);
     }
+  };
+
+  const handleConfirmSetup = async () => {
+    setShowSetupModal(false);
+    
+    const matterTitle = isNewMatter ? (newMatterName.trim() || "New Matter Setup") : linkedMatter;
+    
+    // Construct enriched prompt
+    const finalPrompt = `${pendingPrompt} (Case/Matter: ${matterTitle}, Plaintiff/Party A: ${partyA || "Not Specified"}, Defendant/Party B: ${partyB || "Not Specified"})`;
+    
+    // Setup document headers/category based on intent
+    if (pendingPrompt.toLowerCase().includes("nda") || pendingPrompt.toLowerCase().includes("non-disclosure") || pendingPrompt.toLowerCase().includes("non disclosure")) {
+      setDocumentType("Written Statement");
+      setHeaderText("MUTUAL NON-DISCLOSURE AGREEMENT");
+      setFooterText(`CONFIDENTIAL - CASE: ${matterTitle.toUpperCase()}`);
+    } else if (pendingPrompt.toLowerCase().includes("petition") || pendingPrompt.toLowerCase().includes("writ")) {
+      setDocumentType("Writ Petition");
+      setHeaderText("CIVIL APPELLATE JURISDICTION");
+      setFooterText(`ADVOCATE FOR PETITIONER - CASE: ${matterTitle.toUpperCase()}`);
+    } else {
+      setHeaderText(matterTitle.toUpperCase());
+      setFooterText("CLAUSELY LEGAL OS");
+    }
+    
+    await sendCopilotMessage(finalPrompt, true);
   };
 
   const startVoiceDictation = () => {
@@ -1236,6 +1304,128 @@ Enrollment No: MAH/908/2026`;
           )}
         </aside>
       </div>
+
+      {/* Document Matter Setup Modal */}
+      {showSetupModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 select-none animate-fade-in">
+          <div className="bg-white dark:bg-[#11121a] border border-slate-200 dark:border-slate-800 rounded-3xl w-full max-w-lg p-6 shadow-2xl space-y-5 animate-in fade-in zoom-in duration-200">
+            <div className="flex justify-between items-center pb-2 border-b border-slate-100 dark:border-slate-800/80">
+              <h3 className="text-base font-bold text-slate-900 dark:text-white font-display flex items-center gap-2">
+                <Sparkles className="h-4 w-4 text-blue-500" />
+                Document Matter Setup
+              </h3>
+              <button 
+                type="button"
+                onClick={() => setShowSetupModal(false)}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-350 text-sm font-bold cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              {/* Matter Type Selector */}
+              <div>
+                <label className="block text-xs font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-2">Matter Context</label>
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setIsNewMatter(true)}
+                    className={`p-3 rounded-2xl border text-xs font-semibold flex flex-col items-center gap-1 transition-all cursor-pointer ${
+                      isNewMatter 
+                        ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400" 
+                        : "border-slate-200 dark:border-slate-800/60 text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-900"
+                    }`}
+                  >
+                    <span>🆕 Create New Case</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsNewMatter(false)}
+                    className={`p-3 rounded-2xl border text-xs font-semibold flex flex-col items-center gap-1 transition-all cursor-pointer ${
+                      !isNewMatter 
+                        ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400" 
+                        : "border-slate-200 dark:border-slate-800/60 text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-900"
+                    }`}
+                  >
+                    <span>🔗 Link to Existing</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Matter Name Input or Dropdown Selection */}
+              {isNewMatter ? (
+                <div>
+                  <label className="block text-xs font-semibold text-slate-550 dark:text-slate-400 mb-1.5">New Matter / Case Name</label>
+                  <input
+                    type="text"
+                    value={newMatterName}
+                    onChange={(e) => setNewMatterName(e.target.value)}
+                    placeholder="e.g. Land dispute at Alibaug"
+                    className="w-full bg-slate-50 dark:bg-[#1a1c25] border border-slate-200 dark:border-slate-800 rounded-2xl px-4 py-2.5 text-xs text-slate-900 dark:text-white outline-none"
+                  />
+                </div>
+              ) : (
+                <div>
+                  <label className="block text-xs font-semibold text-slate-550 dark:text-slate-400 mb-1.5 font-sans">Select Active Matter</label>
+                  <select
+                    value={linkedMatter}
+                    onChange={(e) => setLinkedMatter(e.target.value)}
+                    className="w-full bg-slate-50 dark:bg-[#1a1c25] border border-slate-200 dark:border-slate-800 rounded-2xl px-4 py-2.5 text-xs text-slate-750 dark:text-white outline-none cursor-pointer"
+                  >
+                    <option value="ABC Corp vs State of Maharashtra">ABC Corp vs State of Maharashtra</option>
+                    <option value="Sharma Partition Dispute">Sharma Partition Dispute</option>
+                    <option value="TechNova vs InnovateX">TechNova vs InnovateX</option>
+                    <option value="R.K. Builders vs ICC">R.K. Builders vs ICC</option>
+                    <option value="Neha Verma Employee Dispute">Neha Verma Employee Dispute</option>
+                  </select>
+                </div>
+              )}
+
+              {/* Parties Setup */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-550 dark:text-slate-400 mb-1.5">Plaintiff / Party A</label>
+                  <input
+                    type="text"
+                    value={partyA}
+                    onChange={(e) => setPartyA(e.target.value)}
+                    placeholder="Name of Applicant"
+                    className="w-full bg-slate-50 dark:bg-[#1a1c25] border border-slate-200 dark:border-slate-800 rounded-2xl px-4 py-2.5 text-xs text-slate-900 dark:text-white outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-slate-550 dark:text-slate-400 mb-1.5">Defendant / Party B</label>
+                  <input
+                    type="text"
+                    value={partyB}
+                    onChange={(e) => setPartyB(e.target.value)}
+                    placeholder="Name of Opponent"
+                    className="w-full bg-slate-50 dark:bg-[#1a1c25] border border-slate-200 dark:border-slate-800 rounded-2xl px-4 py-2.5 text-xs text-slate-900 dark:text-white outline-none"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="flex gap-3 justify-end pt-3 border-t border-slate-100 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={() => setShowSetupModal(false)}
+                className="px-4 py-2 rounded-2xl border border-slate-200 dark:border-slate-800/80 text-xs font-semibold text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-900 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmSetup}
+                className="px-5 py-2.5 rounded-2xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs cursor-pointer shadow-lg transition-all"
+              >
+                Confirm & Draft
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
