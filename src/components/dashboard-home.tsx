@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
+import { runClauselyAgent } from "@/agent/clauselyAgent";
 import { Activity, BookOpen, FileText, FolderPlus, Loader2, Send, Sparkles, X, MapPin, Globe, ChevronDown, Mic, AudioLines, ShieldCheck, Landmark, MessageSquare, ChevronRight } from "lucide-react";
 
 interface DashboardHomeProps {
@@ -87,19 +88,23 @@ export default function DashboardHome({ onNavigate }: DashboardHomeProps) {
         return;
       }
 
-      setWebGpuProgressText(`Heard: "${transcript}". Generating reply via Gemini...`);
+      setWebGpuProgressText(`Heard: "${transcript}". Running Clausely harness...`);
       setWebGpuProgressVal(0.6);
 
       try {
-        const { generateClientSideText } = await import("../utils/webLlmClient");
-        const reply = await generateClientSideText(
-          transcript,
-          "gemini-3.5-flash",
-          (statusText, progress) => {
-            setWebGpuProgressText(statusText);
-            setWebGpuProgressVal(progress);
-          }
-        );
+        const result = await runClauselyAgent({
+          input: transcript,
+          surface: "home",
+          task: "draft_document",
+          modelPreference: "minicpm5_local",
+          privacyMode: "local_only",
+          context: {
+            jurisdiction: selectedJuri,
+            documentType: "Writ Petition",
+            firmId: "firm_123",
+          },
+        });
+        const reply = result.committedArtifacts.find(artifact => artifact.type === "document")?.text || result.response;
 
         setWebGpuProgressText("Speaking response...");
         setWebGpuProgressVal(0.9);
@@ -185,79 +190,36 @@ export default function DashboardHome({ onNavigate }: DashboardHomeProps) {
 
     setIsHomeAiRunning(true);
 
-    if (useWebGpu) {
-      try {
-        setWebGpuProgressText("Initializing Gemini API client...");
-        setWebGpuProgressVal(0);
-
-        const { generateClientSideText } = await import("../utils/webLlmClient");
-        
-        const clientText = await generateClientSideText(
-          command,
-          "gemini-3.5-flash",
-          (statusText, progress) => {
-            setWebGpuProgressText(statusText);
-            setWebGpuProgressVal(progress);
-          }
-        );
-
-        if (typeof window !== "undefined") {
-          (window as any).__INITIAL_DRAFT__ = clientText || "";
-          (window as any).__INITIAL_JURISDICTION__ = selectedJuri;
-          (window as any).__INITIAL_CHAT_MESSAGES__ = [
-            { sender: "user", text: command },
-            { sender: "ai", text: clientText ? "In-Browser Gemini draft completed." : "In-Browser generation did not return content." }
-          ];
-        }
-
-        setWebGpuProgressText("");
-        setWebGpuProgressVal(0);
-        onNavigate("drafting");
-      } catch (error: any) {
-        console.error(error);
-        setWebGpuProgressText(`Gemini API Error: ${error.message || error}`);
-        setTimeout(() => {
-          setWebGpuProgressText("");
-          setWebGpuProgressVal(0);
-        }, 6000);
-      } finally {
-        setIsHomeAiRunning(false);
-      }
-      return;
-    }
-
     try {
-      const response = await fetch("http://localhost:8080/api/v1/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: command,
-          history: [],
-          context: {
-            surface: "home-dashboard",
-            jurisdiction: selectedJuri,
-            document_type: "Writ Petition",
-            firm_id: "firm_123",
-          },
-        }),
+      setWebGpuProgressText("Running Clausely local harness...");
+      setWebGpuProgressVal(0.35);
+
+      const result = await runClauselyAgent({
+        input: command,
+        surface: "home",
+        task: /\b(?:review|check|analy[sz]e)\b/i.test(command) ? "review_document" : "draft_document",
+        modelPreference: "minicpm5_local",
+        privacyMode: "local_only",
+        context: {
+          jurisdiction: selectedJuri,
+          documentType: "Writ Petition",
+          firmId: "firm_123",
+        },
       });
-
-      if (!response.ok) {
-        throw new Error("Copilot endpoint failed");
-      }
-
-      const data = await response.json();
+      const draftText = result.committedArtifacts.find(artifact => artifact.type === "document")?.text || "";
       
       // Store initial state for Drafting Studio to consume
       if (typeof window !== "undefined") {
-        (window as any).__INITIAL_DRAFT__ = data.document_text || "";
+        (window as any).__INITIAL_DRAFT__ = draftText;
         (window as any).__INITIAL_JURISDICTION__ = selectedJuri;
         (window as any).__INITIAL_CHAT_MESSAGES__ = [
           { sender: "user", text: command },
-          { sender: "ai", text: data.response || "Draft compiled successfully." }
+          { sender: "ai", text: result.response || "Draft compiled through the Clausely local harness." }
         ];
       }
 
+      setWebGpuProgressText("");
+      setWebGpuProgressVal(0);
       // Navigate to drafting studio
       onNavigate("drafting");
     } catch (error) {
@@ -265,9 +227,11 @@ export default function DashboardHome({ onNavigate }: DashboardHomeProps) {
       if (typeof window !== "undefined") {
         (window as any).__INITIAL_CHAT_MESSAGES__ = [
           { sender: "user", text: command },
-          { sender: "ai", text: "I could not reach the local backend on port 8080. Start the FastAPI server and run the command again." }
+          { sender: "ai", text: "The Clausely local harness could not complete that command. Try a narrower drafting instruction." }
         ];
       }
+      setWebGpuProgressText("");
+      setWebGpuProgressVal(0);
       onNavigate("drafting");
     } finally {
       setIsHomeAiRunning(false);
@@ -537,14 +501,13 @@ export default function DashboardHome({ onNavigate }: DashboardHomeProps) {
               )}
             </div>
 
-            {/* WebGPU Toggle Button */}
+            {/* Runtime Status */}
             <button 
               type="button" 
-              className={`chat-dropdown-btn ${useWebGpu ? 'border-blue-500 bg-blue-500/10 text-blue-400 font-bold' : ''}`}
-              onClick={() => setUseWebGpu(!useWebGpu)}
+              className="chat-dropdown-btn border-blue-500 bg-blue-500/10 text-blue-400 font-bold"
             >
               <Sparkles className="h-4 w-4 text-blue-400 animate-pulse" />
-              <span>Runtime: <strong>{useWebGpu ? "In-Browser (Gemini API)" : "Server (FastAPI)"}</strong></span>
+              <span>Runtime: <strong>Local Harness</strong></span>
             </button>
           </div>
         </div>

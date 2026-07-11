@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
+import { runClauselyAgent } from "@/agent/clauselyAgent";
 import { 
   Sparkles, 
   Check, 
@@ -47,6 +48,27 @@ interface PageItem {
   id: string;
   initialText: string;
 }
+
+const cmToTwip = (cm: number) => Math.round((cm / 2.54) * 1440);
+
+const escapeHtml = (value: string) =>
+  value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+
+const downloadBlob = (blob: Blob, fileName: string) => {
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
+};
 
 export default function DraftingStudio() {
   // Toggle states for alternative editors
@@ -278,85 +300,79 @@ Enrollment: MAH/1234/2026`
     return pages.map(page => page.initialText).join("\n\n---PAGE_BREAK---\n\n");
   };
 
+  const getStoredDocumentText = () => {
+    return pages.map(page => page.initialText).join("\n\n---PAGE_BREAK---\n\n");
+  };
+
+  const handlePageInput = (index: number, text: string) => {
+    setPages(prev => prev.map((page, pageIndex) => (
+      pageIndex === index ? { ...page, initialText: text } : page
+    )));
+  };
+
+  const outlineItems = pages.map((page, index) => {
+    const firstLine = page.initialText
+      .split("\n")
+      .map(line => line.trim())
+      .find(Boolean);
+    return {
+      id: page.id,
+      label: `${index + 1}. ${firstLine ? firstLine.slice(0, 32) : `Page ${index + 1}`}`,
+    };
+  });
+
   const sendCopilotMessage = async (message: string) => {
     const cleanMessage = message.trim();
     if (!cleanMessage || isChatSending) return;
 
     const outgoing = { sender: "user", text: cleanMessage };
-    const history = chatMessages;
     setChatMessages(prev => [...prev, outgoing]);
     setActiveSidebarTab("copilot");
     setIsChatSending(true);
 
     try {
-      const response = await fetch("http://localhost:8080/api/v1/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: cleanMessage,
-          history,
-          context: {
-            surface: "drafting-studio",
-            jurisdiction,
-            document_type: documentType,
-            document_text: getDocumentText(),
-            current_document: getDocumentText(),
-            firm_id: "firm_123",
-          },
-        }),
+      const isDraftIntent = /\b(?:create|draft|generate|prepare|write|make)\b.*\b(?:doc|document|petition|agreement|contract|pleading|affidavit|statement|notice|application|reply)\b/i.test(cleanMessage);
+      const result = await runClauselyAgent({
+        input: cleanMessage,
+        surface: "drafting_studio",
+        task: isDraftIntent ? "draft_document" : "chat",
+        modelPreference: isDraftIntent ? "minicpm5_local" : "gemma4_e2b_local",
+        privacyMode: "local_only",
+        context: {
+          jurisdiction,
+          documentType,
+          documentText: getDocumentText(),
+          firmId: "firm_123",
+        },
       });
 
-      if (!response.ok) {
-        throw new Error("Copilot endpoint returned an error");
+      const generatedDocument = result.committedArtifacts.find(artifact => artifact.type === "document")?.text;
+      if (generatedDocument) {
+        const parts = generatedDocument.split(/\n\s*\n(?=(?:The material facts|The grounds|The applicant therefore|IN THE))/i);
+        setPages(parts.map((txt: string, idx: number) => ({
+          id: `page-${idx}-${Date.now()}`,
+          initialText: txt.trim()
+        })));
       }
 
-      const data = await response.json();
-      const generatedText = typeof data.document_text === "string" && data.document_text.trim()
-        ? `${data.response || "Generated draft."}\n\n${data.document_text.replaceAll("---PAGE_BREAK---", "\n\n")}`
-        : data.response || "Done. I routed that through the Clausely backend.";
       setChatMessages(prev => [
         ...prev,
         {
           sender: "ai",
-          text: generatedText,
+          text: generatedDocument
+            ? `${result.response}\n\nI updated the document viewer with the generated draft.`
+            : result.committedArtifacts[0]?.text || result.response,
         },
       ]);
     } catch (error) {
-      console.warn("FastAPI backend offline, falling back to client-side Gemini API: ", error);
-      try {
-        const { generateClientSideText } = await import("../utils/webLlmClient");
-        
-        // Construct prompt with chat history context
-        const historyText = history.map(m => `${m.sender === "user" ? "User" : "AI"}: ${m.text}`).join("\n");
-        const fullPrompt = `Document content:
-${getDocumentText()}
-
-Chat history:
-${historyText}
-
-User message: ${cleanMessage}
-
-As Clausely AI, respond to the user message in the context of the document. If they ask to add, edit, or modify the document, write the updated document text or new clauses clearly.`;
-
-        const replyText = await generateClientSideText(fullPrompt, "gemini-3.5-flash");
-        
-        setChatMessages(prev => [
-          ...prev,
-          {
-            sender: "ai",
-            text: replyText || "No response generated by client-side Gemini.",
-          },
-        ]);
-      } catch (geminiError: any) {
-        console.error("Gemini fallback error: ", geminiError);
-        setChatMessages(prev => [
-          ...prev,
-          {
-            sender: "ai",
-            text: `Failed to fetch: Local backend (8080) is offline, and Gemini client fallback failed: ${geminiError.message || geminiError}`,
-          },
-        ]);
-      }
+      console.error("Clausely harness chat error: ", error);
+      setChatMessages(prev => [
+        ...prev,
+        {
+          sender: "ai",
+          text: "The local Clausely harness could not complete that message. Please try again with a narrower instruction.",
+        },
+      ]);
     } finally {
       setIsChatSending(false);
     }
@@ -445,7 +461,6 @@ As Clausely AI, respond to the user message in the context of the document. If t
     setAiPrompt("");
 
     try {
-      // 1. Check if this is a general greeting or conversational prompt (instead of document generation)
       const isGreeting = /^(?:hi|hello|hey|greetings|howdy|sup)\b/i.test(userPrompt.trim());
       const isCopilotAction = /\b(?:matter|playbook|strategy|strategist|registry|sfe|validate|scrutiny)\b/i.test(userPrompt);
       if (isGreeting || isCopilotAction) {
@@ -454,60 +469,23 @@ As Clausely AI, respond to the user message in the context of the document. If t
         return;
       }
 
-      // 2. Check if this is a request to start a new document
-      const isNewDocRequest = /new\s+(?:doc|petition|agreement|contract|pleading|affidavit|statement)|start\s+fresh|create\s+new/i.test(userPrompt);
-      if (isNewDocRequest) {
-        const currentDocText = pageRefs.current
-          .filter(Boolean)
-          .map(el => el!.innerText)
-          .join("\n\n---PAGE_BREAK---\n\n");
-          
-        try {
-          await fetch("http://localhost:8080/api/v1/backup", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              document_text: currentDocText,
-              document_title: documentType.replace(/\s+/g, "_")
-            })
-          });
-          setChatMessages(prev => [
-            ...prev,
-            { sender: "ai", text: "Backup saved. Starting a fresh document now." }
-          ]);
-          setActiveSidebarTab("copilot");
-        } catch (backupError) {
-          console.warn("Failed to backup document: ", backupError);
-        }
-      }
-
-      // 3. Native MiniCPM generation for ordinary draft/text requests.
-      const generationRes = await fetch("http://localhost:8080/api/v1/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: userPrompt,
-          document_type: documentType,
+      const result = await runClauselyAgent({
+        input: userPrompt,
+        surface: "drafting_studio",
+        task: "draft_document",
+        modelPreference: "minicpm5_local",
+        privacyMode: "local_only",
+        context: {
           jurisdiction,
-          review_with_gemma: false,
-          context: {
-            surface: "drafting-studio",
-            document_type: documentType,
-            jurisdiction,
-            document_text: getDocumentText(),
-            current_document: getDocumentText(),
-          },
-        })
+          documentType,
+          documentText: getDocumentText(),
+          firmId: "firm_123",
+        },
       });
 
-      if (!generationRes.ok) {
-        throw new Error("Native MiniCPM generation endpoint returned error");
-      }
-
-      const data = await generationRes.json();
-      if (data.document_text) {
-        // Split text by page break tokens or divide logically
-        const parts = data.document_text.split("---PAGE_BREAK---");
+      const generatedText = result.committedArtifacts.find(artifact => artifact.type === "document")?.text;
+      if (generatedText) {
+        const parts = generatedText.split(/\n\s*\n(?=(?:The material facts|The grounds|The applicant therefore|IN THE))/i);
         setPages(parts.map((txt: string, idx: number) => ({
           id: `page-${idx}-${Date.now()}`,
           initialText: txt.trim()
@@ -518,39 +496,12 @@ As Clausely AI, respond to the user message in the context of the document. If t
           { sender: "user", text: userPrompt },
           {
             sender: "ai",
-            text: `${data.response || "Generated draft."} Model: ${data.model || "MiniCPM 5"}.`,
+            text: `${result.response}\n\nPlan: ${result.plan.steps.map(step => step.description).join(" -> ")}`,
           }
         ]);
       }
     } catch (error) {
-      console.warn("Native MiniCPM generation error, trying client-side Gemini fallback: ", error);
-      try {
-        const { generateClientSideText } = await import("../utils/webLlmClient");
-        const fullPrompt = `You are Clausely In-Browser Drafting Core. Generate a court-ready document draft of category "${documentType}" for jurisdiction "${jurisdiction}". User prompt: ${userPrompt}. Return only the document text. Use '---PAGE_BREAK---' for page splits.`;
-        
-        const clientText = await generateClientSideText(fullPrompt, "gemini-3.5-flash");
-        if (clientText && clientText.trim()) {
-          const parts = clientText.split("---PAGE_BREAK---");
-          setPages(parts.map((txt: string, idx: number) => ({
-            id: `page-${idx}-${Date.now()}`,
-            initialText: txt.trim()
-          })));
-          setActiveSidebarTab("copilot");
-          setChatMessages(prev => [
-            ...prev,
-            { sender: "user", text: userPrompt },
-            {
-              sender: "ai",
-              text: `Generated draft using client-side Gemini fallback.`,
-            }
-          ]);
-          return;
-        }
-      } catch (geminiError) {
-        console.error("Gemini draft fallback failed: ", geminiError);
-      }
-
-      // Fallback local template generation
+      console.warn("Clausely harness generation error, using static local fallback: ", error);
       const fallbackTextPage1 = `${headerText}
 ${jurisdiction === "MH-HC" ? "CIVIL APPELLATE JURISDICTION" : "CIVIL JURISDICTION"}
 ${documentType === "Writ Petition" ? "WRIT PETITION (CIVIL) NO. 9982 OF 2026" : "CIVIL SUIT NO. 1120 OF 2026"}
@@ -600,44 +551,134 @@ Enrollment No: MAH/908/2026`;
     await sendCopilotMessage(msg);
   };
 
-  const handleExport = async (format: "pdf" | "docx") => {
+  const handleExport = async (format: "pdf" | "docx" | "txt" | "html" | "md") => {
     setShowExportDropdown(false);
-    
-    // Read text from all page elements dynamically
-    const docText = pageRefs.current
-      .filter(Boolean)
-      .map(el => el!.innerText)
-      .join("\n\n---PAGE_BREAK---\n\n");
+    const docText = getDocumentText().replaceAll("---PAGE_BREAK---", "\n\n");
 
     try {
-      const response = await fetch("http://localhost:8080/api/v1/export", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          document_text: docText,
-          jurisdiction: jurisdiction,
-          format: format,
-          metadata: {
-            title: "Service_Agreement",
-            document_type: documentType
-          }
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error("Export failed");
+      if (format === "txt") {
+        downloadBlob(new Blob([docText], { type: "text/plain;charset=utf-8" }), `${documentType.replace(/\s+/g, "_")}.txt`);
+        return;
       }
 
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `Service_Agreement.${format}`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      if (format === "md") {
+        const markdown = `# ${documentType}\n\n${docText}`;
+        downloadBlob(new Blob([markdown], { type: "text/markdown;charset=utf-8" }), `${documentType.replace(/\s+/g, "_")}.md`);
+        return;
+      }
+
+      if (format === "html") {
+        const html = `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>${escapeHtml(documentType)}</title>
+    <style>
+      body { font-family: "Times New Roman", serif; font-size: ${fontSize}pt; line-height: ${lineSpacing}; margin: ${topMargin}cm ${rightMargin}cm ${bottomMargin}cm ${leftMargin}cm; }
+      header { text-align: center; font-weight: bold; margin-bottom: 24px; }
+      main { white-space: pre-wrap; }
+      footer { margin-top: 32px; font-size: 10pt; display: flex; justify-content: space-between; }
+    </style>
+  </head>
+  <body>
+    <header>${escapeHtml(headerText)}</header>
+    <main>${escapeHtml(docText)}</main>
+    <footer><span>${escapeHtml(footerText)}</span><span>Page 1</span></footer>
+  </body>
+</html>`;
+        downloadBlob(new Blob([html], { type: "text/html;charset=utf-8" }), `${documentType.replace(/\s+/g, "_")}.html`);
+        return;
+      }
+
+      if (format === "pdf") {
+        const printWindow = window.open("", "_blank");
+        if (!printWindow) throw new Error("Could not open print window");
+        printWindow.document.write(`
+          <html>
+            <head>
+              <title>${documentType}</title>
+              <style>
+                @page { margin: ${topMargin}cm ${rightMargin}cm ${bottomMargin}cm ${leftMargin}cm; }
+                body { font-family: "Times New Roman", serif; font-size: ${fontSize}pt; line-height: ${lineSpacing}; white-space: pre-wrap; }
+                header { text-align: center; font-weight: bold; margin-bottom: 24px; }
+                footer { position: fixed; bottom: 0; left: 0; right: 0; font-size: 10pt; display: flex; justify-content: space-between; }
+              </style>
+            </head>
+            <body>
+              <header>${escapeHtml(headerText)}</header>
+              <main>${escapeHtml(docText)}</main>
+              <footer><span>${escapeHtml(footerText)}</span><span>Page </span></footer>
+            </body>
+          </html>
+        `);
+        printWindow.document.close();
+        printWindow.focus();
+        printWindow.print();
+        return;
+      }
+
+      const docx = await import("docx");
+      const {
+        AlignmentType,
+        Document,
+        Footer,
+        Header,
+        Packer,
+        PageNumber,
+        Paragraph,
+        TextRun,
+      } = docx;
+
+      const documentFile = new Document({
+        sections: [
+          {
+            properties: {
+              page: {
+                margin: {
+                  top: cmToTwip(topMargin),
+                  right: cmToTwip(rightMargin),
+                  bottom: cmToTwip(bottomMargin),
+                  left: cmToTwip(leftMargin),
+                },
+              },
+            },
+            headers: {
+              default: new Header({
+                children: [
+                  new Paragraph({
+                    alignment: AlignmentType.CENTER,
+                    children: [new TextRun({ text: headerText, bold: true, size: fontSize * 2 })],
+                  }),
+                ],
+              }),
+            },
+            footers: {
+              default: new Footer({
+                children: [
+                  new Paragraph({
+                    children: [
+                      new TextRun({ text: footerText, size: 20 }),
+                      new TextRun({ text: "    Page ", size: 20 }),
+                      new TextRun({ children: [PageNumber.CURRENT], size: 20 }),
+                    ],
+                  }),
+                ],
+              }),
+            },
+            children: docText.split(/\n{2,}/).map((para) =>
+              new Paragraph({
+                spacing: { after: 240, line: Math.round(lineSpacing * 240) },
+                children: [new TextRun({ text: para.replace(/\n/g, " "), size: fontSize * 2 })],
+              }),
+            ),
+          },
+        ],
+      });
+
+      const blob = await Packer.toBlob(documentFile);
+      downloadBlob(blob, `${documentType.replace(/\s+/g, "_")}.docx`);
     } catch (error) {
-      alert("Failed to export document. Please ensure the backend server is running on port 8080.");
+      alert("Failed to export document from the local Clausely exporter.");
       console.error(error);
     }
   };
@@ -704,6 +745,24 @@ Enrollment No: MAH/908/2026`;
                 >
                   Export as Word (.docx)
                 </button>
+                <button 
+                  onClick={() => handleExport("txt")}
+                  className="w-full px-4 py-2 text-left text-slate-700 dark:text-slate-355 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                >
+                  Export as Text (.txt)
+                </button>
+                <button 
+                  onClick={() => handleExport("html")}
+                  className="w-full px-4 py-2 text-left text-slate-700 dark:text-slate-355 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                >
+                  Export as HTML (.html)
+                </button>
+                <button 
+                  onClick={() => handleExport("md")}
+                  className="w-full px-4 py-2 text-left text-slate-700 dark:text-slate-355 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                >
+                  Export as Markdown (.md)
+                </button>
               </div>
             )}
           </div>
@@ -743,22 +802,236 @@ Enrollment No: MAH/908/2026`;
             <span className="text-[10px] text-slate-450 dark:text-slate-500">All changes saved</span>
           </div>
 
-          {/* Document Editor Placeholder */}
-          <div className="flex-1 flex flex-col items-center justify-center bg-slate-100/50 dark:bg-black/10 p-12 text-center overflow-y-auto">
-            <div className="max-w-xl w-full p-8 bg-white dark:bg-[#11121a] border border-slate-200 dark:border-slate-800 rounded-3xl shadow-xl flex flex-col items-center space-y-4">
-              <div className="w-16 h-16 rounded-2xl bg-blue-600/10 flex items-center justify-center text-blue-500 border border-blue-500/10">
-                <FileText className="h-8 w-8" />
-              </div>
-              <h3 className="text-lg font-bold text-slate-900 dark:text-white font-display">Clausely Document Viewer</h3>
-              <p className="text-xs text-slate-400 leading-relaxed font-sans max-w-sm">
-                Workspace is ready. Use the AI Copilot sidebar on the right to query, draft, or refine your legal documents.
-              </p>
-              {getDocumentText() && (
-                <div className="w-full text-left p-5 bg-slate-50 dark:bg-[#090a0f] border border-slate-200 dark:border-slate-800/80 rounded-2xl max-h-[360px] overflow-y-auto font-mono text-[11px] text-slate-650 dark:text-slate-300 leading-relaxed whitespace-pre-wrap select-text shadow-inner">
-                  {getDocumentText()}
-                </div>
+          {/* ONLYOFFICE Desktop Ribbon Toolbar clone */}
+          <div className="flex flex-col bg-[#f4f4f4] dark:bg-[#1a1c24] border-b border-[#d1d1d1] dark:border-[#2d303f] shrink-0 text-slate-700 dark:text-slate-200">
+            {/* Tab Headers */}
+            <div className="flex bg-[#2c303b] dark:bg-[#0c0d12] text-slate-300 text-[11px] font-medium h-9 px-4 items-end gap-1.5 select-none">
+              {["Home", "Layout", "Insert"].map((tab) => (
+                <button 
+                  key={tab} 
+                  type="button"
+                  onClick={() => setOnlyOfficeTab(tab)}
+                  className={`px-3 py-1.5 rounded-t-lg transition-colors cursor-pointer ${
+                    onlyOfficeTab === tab 
+                      ? "bg-[#f4f4f4] dark:bg-[#1a1c24] text-[#df5626] font-bold border-t border-x border-[#d1d1d1] dark:border-[#2d303f]" 
+                      : "hover:bg-[#3d4251] dark:hover:bg-[#1c1e27] hover:text-white"
+                  }`}
+                >
+                  {tab}
+                </button>
+              ))}
+            </div>
+
+            {/* Active Ribbon Panel */}
+            <div className="flex items-center gap-4 px-6 py-2.5 bg-[#f4f4f4] dark:bg-[#1a1c24] border-b border-[#d1d1d1] dark:border-[#2d303f] text-xs h-14 overflow-x-auto">
+              {onlyOfficeTab === "Home" && (
+                <>
+                  {/* Font Family & Size */}
+                  <div className="flex items-center gap-1.5 border-r border-[#d1d1d1] dark:border-[#2d303f] pr-4 h-full shrink-0">
+                    <select 
+                      onChange={(e) => executeFormat("fontName", e.target.value)}
+                      className="bg-white dark:bg-[#252836] border border-[#ccc] dark:border-[#40445a] rounded px-1.5 py-0.5 outline-none font-sans text-xs w-36 cursor-pointer text-slate-805 dark:text-white"
+                    >
+                      <option value="Times New Roman">Times New Roman</option>
+                      <option value="Arial">Arial</option>
+                      <option value="Courier New">Courier New</option>
+                    </select>
+                    <select 
+                      value={fontSize}
+                      onChange={(e) => setFontSize(Number(e.target.value))}
+                      className="bg-white dark:bg-[#252836] border border-[#ccc] dark:border-[#40445a] rounded px-2.5 py-0.5 outline-none font-sans text-xs w-20 cursor-pointer text-slate-805 dark:text-white"
+                    >
+                      <option value="10">10 pt</option>
+                      <option value="12">12 pt</option>
+                      <option value="14">14 pt</option>
+                      <option value="16">16 pt</option>
+                    </select>
+                  </div>
+
+                  {/* Bold/Italic/Underline */}
+                  <div className="flex items-center gap-1 border-r border-[#d1d1d1] dark:border-[#2d303f] pr-4 h-full shrink-0">
+                    <button type="button" onClick={() => executeFormat("bold")} className="p-1 rounded hover:bg-[#e0e0e0] dark:hover:bg-slate-700 font-bold text-slate-850 dark:text-white cursor-pointer w-7 h-7 flex items-center justify-center"><Bold className="h-3.5 w-3.5" /></button>
+                    <button type="button" onClick={() => executeFormat("italic")} className="p-1 rounded hover:bg-[#e0e0e0] dark:hover:bg-slate-700 italic text-slate-850 dark:text-white cursor-pointer w-7 h-7 flex items-center justify-center"><Italic className="h-3.5 w-3.5" /></button>
+                    <button type="button" onClick={() => executeFormat("underline")} className="p-1 rounded hover:bg-[#e0e0e0] dark:hover:bg-slate-700 underline text-slate-850 dark:text-white cursor-pointer w-7 h-7 flex items-center justify-center"><Underline className="h-3.5 w-3.5" /></button>
+                  </div>
+
+                  {/* Paragraph Alignments */}
+                  <div className="flex items-center gap-1 border-r border-[#d1d1d1] dark:border-[#2d303f] pr-4 h-full shrink-0">
+                    <button type="button" onClick={() => executeFormat("justifyLeft")} className="p-1 rounded hover:bg-[#e0e0e0] dark:hover:bg-slate-700 text-slate-850 dark:text-white cursor-pointer w-7 h-7 flex items-center justify-center"><AlignLeft className="h-3.5 w-3.5" /></button>
+                    <button type="button" onClick={() => executeFormat("justifyCenter")} className="p-1 rounded hover:bg-[#e0e0e0] dark:hover:bg-slate-700 text-slate-850 dark:text-white cursor-pointer w-7 h-7 flex items-center justify-center"><AlignCenter className="h-3.5 w-3.5" /></button>
+                    <button type="button" onClick={() => executeFormat("justifyRight")} className="p-1 rounded hover:bg-[#e0e0e0] dark:hover:bg-slate-700 text-slate-850 dark:text-white cursor-pointer w-7 h-7 flex items-center justify-center"><AlignRight className="h-3.5 w-3.5" /></button>
+                    <button type="button" onClick={() => executeFormat("justifyFull")} className="p-1 rounded hover:bg-[#e0e0e0] dark:hover:bg-slate-700 text-slate-850 dark:text-white cursor-pointer w-7 h-7 flex items-center justify-center"><AlignJustify className="h-3.5 w-3.5" /></button>
+                  </div>
+
+                  {/* Bullet Lists & Print */}
+                  <div className="flex items-center gap-1.5 h-full shrink-0">
+                    <button type="button" onClick={() => executeFormat("insertUnorderedList")} className="p-1 rounded hover:bg-[#e0e0e0] dark:hover:bg-slate-700 text-slate-850 dark:text-white cursor-pointer w-7 h-7 flex items-center justify-center" title="Bullet List"><List className="h-3.5 w-3.5" /></button>
+                    <button type="button" onClick={() => window.print()} className="p-1 rounded hover:bg-[#e0e0e0] dark:hover:bg-slate-700 text-slate-850 dark:text-white cursor-pointer w-7 h-7 flex items-center justify-center" title="Print Document"><Printer className="h-3.5 w-3.5" /></button>
+                  </div>
+                </>
+              )}
+
+              {onlyOfficeTab === "Layout" && (
+                <>
+                  {/* Line Spacing */}
+                  <div className="flex items-center gap-1.5 border-r border-[#d1d1d1] dark:border-[#2d303f] pr-4 h-full shrink-0">
+                    <span className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">Line Spacing:</span>
+                    <select 
+                      value={lineSpacing}
+                      onChange={(e) => setLineSpacing(Number(e.target.value))}
+                      className="bg-white dark:bg-[#252836] border border-[#ccc] dark:border-[#40445a] rounded px-2 py-0.5 outline-none font-sans text-xs w-20 cursor-pointer text-slate-805 dark:text-white"
+                    >
+                      <option value="1">1.0</option>
+                      <option value="1.5">1.5</option>
+                      <option value="2">2.0 (Double)</option>
+                    </select>
+                  </div>
+
+                  {/* Margins */}
+                  <div className="flex items-center gap-1.5 h-full shrink-0">
+                    <span className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">Margins:</span>
+                    <button 
+                      type="button"
+                      onClick={() => { setLeftMargin(3.0); setRightMargin(2.5); setTopMargin(3.0); setBottomMargin(2.5); }}
+                      className="px-2 py-1 rounded bg-white dark:bg-[#252836] border border-[#ccc] dark:border-[#40445a] text-[11px] font-semibold cursor-pointer text-slate-750 dark:text-slate-200 hover:bg-[#e0e0e0] dark:hover:bg-slate-700"
+                    >
+                      Normal (3cm)
+                    </button>
+                    <button 
+                      type="button"
+                      onClick={() => { setLeftMargin(2.0); setRightMargin(2.0); setTopMargin(2.0); setBottomMargin(2.0); }}
+                      className="px-2 py-1 rounded bg-white dark:bg-[#252836] border border-[#ccc] dark:border-[#40445a] text-[11px] font-semibold cursor-pointer text-slate-750 dark:text-slate-200 hover:bg-[#e0e0e0] dark:hover:bg-slate-700"
+                    >
+                      Narrow (2cm)
+                    </button>
+                    <button 
+                      type="button"
+                      onClick={() => { setLeftMargin(4.0); setRightMargin(3.5); setTopMargin(3.5); setBottomMargin(3.0); }}
+                      className="px-2 py-1 rounded bg-white dark:bg-[#252836] border border-[#ccc] dark:border-[#40445a] text-[11px] font-semibold cursor-pointer text-slate-750 dark:text-slate-200 hover:bg-[#e0e0e0] dark:hover:bg-slate-700"
+                    >
+                      Wide (4cm)
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {onlyOfficeTab === "Insert" && (
+                <>
+                  <button 
+                    type="button"
+                    onClick={handleAddPage}
+                    className="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500 text-white font-semibold text-[11px] flex items-center gap-1.5 cursor-pointer shadow-sm animate-fade-in"
+                  >
+                    <PlusCircle className="h-3.5 w-3.5" />
+                    <span>Add New Page</span>
+                  </button>
+                </>
               )}
             </div>
+          </div>
+
+          {/* Actual Document Sheet View / Stacked Pages */}
+          <div className="flex-1 overflow-auto p-8 xl:p-12 pb-28 flex flex-col items-center gap-8 bg-slate-200 dark:bg-slate-900/40 relative">
+            {/* Horizontal Document Layout Ruler */}
+            <div className="absolute top-0 left-0 right-0 h-6 bg-[#f4f4f4] dark:bg-[#1a1c24] border-b border-[#d1d1d1] dark:border-[#2d303f] flex items-center justify-between text-[8px] text-slate-400 dark:text-slate-500 px-24 z-20 shadow-inner select-none font-mono">
+              <span>0</span>
+              <span>•</span>
+              <span>•</span>
+              <span>•</span>
+              <span>5</span>
+              <span>•</span>
+              <span>•</span>
+              <span>•</span>
+              <span>10</span>
+              <span>•</span>
+              <span>•</span>
+              <span>•</span>
+              <span>15</span>
+              <span>•</span>
+              <span>•</span>
+              <span>•</span>
+              <span>20</span>
+              <span>•</span>
+              <span>•</span>
+              <span>•</span>
+              <span>25</span>
+            </div>
+
+            {pages.map((page, index) => (
+              <div 
+                key={page.id}
+                className="bg-white text-slate-900 border border-slate-350 shadow-2xl relative flex flex-col justify-between flex-shrink-0 group"
+                style={{
+                  width: "210mm",
+                  height: "297mm",
+                  boxSizing: "border-box",
+                  fontFamily: "Times New Roman, serif",
+                  paddingLeft: `${leftMargin}cm`,
+                  paddingRight: `${rightMargin}cm`,
+                  paddingTop: "1.5cm",
+                  paddingBottom: "1.5cm",
+                  marginTop: index === 0 ? "1.5rem" : "0"
+                }}
+              >
+                {/* Delete Page hover button */}
+                {pages.length > 1 && (
+                  <button 
+                    type="button"
+                    onClick={() => handleDeletePage(page.id)}
+                    className="absolute top-4 right-4 p-1.5 rounded-lg bg-red-50 text-red-500 border border-red-200 hover:bg-red-100 dark:bg-red-950/20 dark:border-red-900/30 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer z-20"
+                    title="Delete Page"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                )}
+
+                {/* Page Header */}
+                <div 
+                  contentEditable 
+                  suppressContentEditableWarning
+                  onBlur={(e) => setHeaderText(e.currentTarget.innerText)}
+                  className="absolute top-4 left-0 right-0 text-center text-[9pt] text-slate-400 border-b border-slate-100 pb-1 mx-12 font-sans outline-none uppercase tracking-wider z-10"
+                >
+                  {headerText}
+                </div>
+
+                {/* Content Area */}
+                <div 
+                  ref={el => { pageRefs.current[index] = el; }}
+                  contentEditable
+                  suppressContentEditableWarning
+                  onKeyDown={(e) => handleKeyDown(e, index)}
+                  onBlur={(e) => handlePageInput(index, e.currentTarget.innerText)}
+                  className="outline-none text-justify w-full cursor-text overflow-hidden pr-1"
+                  style={{
+                    fontSize: `${fontSize}pt`,
+                    lineHeight: lineSpacing,
+                    fontFamily: "Times New Roman, serif",
+                    marginTop: `${topMargin - 1.5}cm`,
+                    marginBottom: `${bottomMargin - 1.5}cm`,
+                    height: "calc(297mm - 6.5cm)",
+                    maxHeight: "calc(297mm - 6.5cm)"
+                  }}
+                  dangerouslySetInnerHTML={{ __html: page.initialText.replace(/\n/g, "<br/>") }}
+                />
+
+                {/* Page Footer */}
+                <div className="absolute bottom-4 left-12 right-12 flex justify-between items-center text-[9pt] text-slate-455 border-t border-slate-100 pt-1 font-sans z-10">
+                  <span contentEditable suppressContentEditableWarning onBlur={(e) => setFooterText(e.currentTarget.innerText)} className="outline-none uppercase tracking-wider">{footerText}</span>
+                  <span className="font-semibold font-mono">Page {index + 1} of {pages.length}</span>
+                </div>
+              </div>
+            ))}
+
+            {/* Dynamic Add Page Controller Button */}
+            <button 
+              type="button"
+              onClick={handleAddPage}
+              className="mt-4 px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs flex items-center gap-2 shadow-lg hover:shadow-xl transition-all cursor-pointer border border-blue-500/20"
+            >
+              <PlusCircle className="h-4 w-4" />
+              <span>Add Page</span>
+            </button>
           </div>
 
 
