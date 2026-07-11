@@ -334,34 +334,13 @@ Enrollment: MAH/1234/2026`
     const cleanMessage = message.trim();
     if (!cleanMessage || isChatSending) return;
 
-    // Detect draft / creation intents (including terms like 'nda', 'agreement', 'writ')
-    const isDraftIntent = /\b(?:create|draft|generate|prepare|write|make|nda|contract|agreement|petition)\b/i.test(cleanMessage);
-
-    if (isDraftIntent && !bypassModal) {
-      setPendingPrompt(cleanMessage);
-      const ndaMatch = /\bnda\b/i.test(cleanMessage);
-      const petitionMatch = /\b(?:petition|writ)\b/i.test(cleanMessage);
-      
-      if (ndaMatch) {
-        setNewMatterName("NDA Drafting Workspace");
-      } else if (petitionMatch) {
-        setNewMatterName("Writ Petition Workspace");
-      } else {
-        setNewMatterName("Clausely Drafting Project");
-      }
-      
-      setPartyA("");
-      setPartyB("");
-      setShowSetupModal(true);
-      return;
-    }
-
     const outgoing = { sender: "user", text: cleanMessage };
     setChatMessages(prev => [...prev, outgoing]);
     setActiveSidebarTab("copilot");
     setIsChatSending(true);
 
     try {
+      const isDraftIntent = /\b(?:create|draft|generate|prepare|write|make|nda|contract|agreement|petition)\b/i.test(cleanMessage);
       const result = await runClauselyAgent({
         input: cleanMessage,
         surface: "drafting_studio",
@@ -376,37 +355,68 @@ Enrollment: MAH/1234/2026`
         },
       });
 
-      const generatedDocument = result.committedArtifacts.find(
-        artifact => artifact.type === "document" || artifact.type === "chat_response"
-      )?.text;
-
-      if (generatedDocument) {
-        let parts: string[] = [];
-        if (generatedDocument.includes("---PAGE_BREAK---")) {
-          parts = generatedDocument.split("---PAGE_BREAK---");
-        } else {
-          // Robust logical splitter for NDAs, agreements, contracts, and petitions
-          parts = generatedDocument.split(/\n\s*\n(?=(?:ARTICLE|SECTION|CLAUSE|WHEREAS|IN WITNESS|NOW THEREFORE|PRAYER|VERIFICATION|PETITION|PETITIONER|RESPONDENT|In the matter of|Petitioner respectfully submits))/i);
-          if (parts.length <= 1) {
-            parts = generatedDocument.split("\n\n");
-          }
-        }
-
-        setPages(parts.map((txt: string, idx: number) => ({
-          id: `page-${idx}-${Date.now()}`,
-          initialText: txt.trim()
-        })));
+      let responseText = result.response;
+      let parsedJson: any = null;
+      try {
+        const cleanJsonText = responseText.replace(/```json/g, "").replace(/```/g, "").trim();
+        parsedJson = JSON.parse(cleanJsonText);
+      } catch (e) {
+        // Not a JSON block, treat as plain text
       }
 
-      setChatMessages(prev => [
-        ...prev,
-        {
-          sender: "ai",
-          text: generatedDocument
-            ? `${result.response}\n\nI updated the document viewer with the generated draft.`
-            : result.committedArtifacts[0]?.text || result.response,
-        },
-      ]);
+      if (parsedJson && parsedJson.action?.tool === "request_matter_setup" && !bypassModal) {
+        // Model reasoned that it needs matter setup!
+        setPendingPrompt(cleanMessage);
+        setNewMatterName(parsedJson.action.parameters.suggestedMatterName || "New Case");
+        
+        const docType = parsedJson.action.parameters.docType || "Agreement";
+        setDocumentType(docType);
+        
+        setPartyA("");
+        setPartyB("");
+        setShowSetupModal(true);
+
+        setChatMessages(prev => [
+          ...prev,
+          {
+            sender: "ai",
+            text: parsedJson.reply || "I need to set up the case/matter details to proceed. Please fill out the popup.",
+          },
+        ]);
+      } else {
+        const finalReply = parsedJson ? parsedJson.reply : responseText;
+        const generatedDocument = result.committedArtifacts.find(
+          artifact => artifact.type === "document" || artifact.type === "chat_response"
+        )?.text;
+
+        if (generatedDocument) {
+          let parts: string[] = [];
+          if (generatedDocument.includes("---PAGE_BREAK---")) {
+            parts = generatedDocument.split("---PAGE_BREAK---");
+          } else {
+            // Robust logical splitter for NDAs, agreements, contracts, and petitions
+            parts = generatedDocument.split(/\n\s*\n(?=(?:ARTICLE|SECTION|CLAUSE|WHEREAS|IN WITNESS|NOW THEREFORE|PRAYER|VERIFICATION|PETITION|PETITIONER|RESPONDENT|In the matter of|Petitioner respectfully submits))/i);
+            if (parts.length <= 1) {
+              parts = generatedDocument.split("\n\n");
+            }
+          }
+
+          setPages(parts.map((txt: string, idx: number) => ({
+            id: `page-${idx}-${Date.now()}`,
+            initialText: txt.trim()
+          })));
+        }
+
+        setChatMessages(prev => [
+          ...prev,
+          {
+            sender: "ai",
+            text: generatedDocument
+              ? `${finalReply}\n\nI updated the document viewer with the generated draft.`
+              : finalReply,
+          },
+        ]);
+      }
     } catch (error) {
       console.error("Clausely harness chat error: ", error);
       setChatMessages(prev => [
