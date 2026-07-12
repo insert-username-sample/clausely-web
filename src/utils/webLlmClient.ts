@@ -12,7 +12,8 @@ export async function generateClientSideText(
     onProgress("Connecting to Google AI Studio...", 0.2);
   }
 
-  const apiKey = "AIzaSyBxIH7djQBGfyseyXtRDxXOfnSg_Up5hOI";
+  const storedKey = typeof window !== "undefined" ? localStorage.getItem("clausely_gemini_api_key") : null;
+  const apiKey = storedKey || "AIzaSyBxIH7djQBGfyseyXtRDxXOfnSg_Up5hOI";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
 
   try {

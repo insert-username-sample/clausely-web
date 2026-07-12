@@ -33,10 +33,42 @@ function deterministicLocalGenerate(request: ModelGenerateRequest) {
   const documentType = matchLine(prompt, /^Document type:\s*(.+?)\.$/im) ?? "Legal Document";
 
   if (request.task === "chat") {
-    return [
-      "I can help with that from the current document context.",
-      "For safe execution, Clausely will break the work into small verified tasks, apply formatting rules, and keep the latest document version as the source of truth.",
-    ].join(" ");
+    // If user prompt is about drafting or creating a document
+    if (/\b(?:create|draft|generate|prepare|write|make|nda|contract|agreement|petition)\b/i.test(prompt)) {
+      // If it contains the case setup details already (meaning it's the second confirm step)
+      if (/Case\/Matter:/i.test(prompt)) {
+        return JSON.stringify({
+          thought: "I have received the matter context and party names. I will now compile the full draft based on the specified parties.",
+          reply: "I have successfully drafted the Non-Disclosure Agreement for you. You can review the details on the canvas.",
+          action: null
+        });
+      }
+
+      // First step: model reasons it needs the matter setup!
+      const isNda = /\bnda\b/i.test(prompt);
+      const isPetition = /\b(?:petition|writ)\b/i.test(prompt);
+      const suggestedName = isNda ? "NDA Drafting Workspace" : isPetition ? "Writ Petition Workspace" : "Clausely Drafting Project";
+      const docType = isNda ? "Agreement" : isPetition ? "Writ Petition" : "Agreement";
+
+      return JSON.stringify({
+        thought: `The user wants to draft a document: "${prompt}". I need to know which matter/project this document belongs to, and what the names of the two parties (Party A and Party B) are. I will call the 'request_matter_setup' action to collect this information from the user before generating.`,
+        reply: `To generate a precise ${isNda ? "Non-Disclosure Agreement" : "legal document"}, I need to set up the case context. Let's configure the matter and party details.`,
+        action: {
+          tool: "request_matter_setup",
+          parameters: {
+            suggestedMatterName: suggestedName,
+            docType: docType
+          }
+        }
+      });
+    }
+
+    // Default chat
+    return JSON.stringify({
+      thought: "This is a general greeting or query. I will answer directly.",
+      reply: "I can help with that from the current document context. For safe execution, Clausely will break the work into small verified tasks, apply formatting rules, and keep the latest document version as the source of truth.",
+      action: null
+    });
   }
 
   if (/cause title/i.test(title)) {

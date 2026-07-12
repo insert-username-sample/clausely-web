@@ -18,6 +18,16 @@ export default function DashboardHome({ onNavigate }: DashboardHomeProps) {
   const [homeAiInput, setHomeAiInput] = useState("");
   const [isHomeAiRunning, setIsHomeAiRunning] = useState(false);
   
+  // Interactive Home Chat States
+  const [chatMessages, setChatMessages] = useState<Array<{ sender: "user" | "ai"; text: string; thought?: string; action?: any }>>([]);
+  const [pendingPrompt, setPendingPrompt] = useState("");
+  const [showSetupModal, setShowSetupModal] = useState(false);
+  const [isNewMatter, setIsNewMatter] = useState(true);
+  const [newMatterName, setNewMatterName] = useState("");
+  const [linkedMatter, setLinkedMatter] = useState("ABC Corp vs State of Maharashtra");
+  const [partyA, setPartyA] = useState("");
+  const [partyB, setPartyB] = useState("");
+
   const [showJuriDropdown, setShowJuriDropdown] = useState(false);
   const [showLangDropdown, setShowLangDropdown] = useState(false);
   const [selectedJuri, setSelectedJuri] = useState("MH-HC");
@@ -171,34 +181,26 @@ export default function DashboardHome({ onNavigate }: DashboardHomeProps) {
     setShowDemoVideo(true);
   };
 
-  const submitHomeAi = async (overrideMessage?: string) => {
+  const submitHomeAi = async (overrideMessage?: string, bypassModal: boolean = false) => {
     const command = (overrideMessage ?? homeAiInput).trim();
     if (!command || isHomeAiRunning) return;
 
     setHomeAiInput("");
-
-    // If the prompt contains "create" or "draft", automatically route and continue the chat!
-    const isCreateOrDraft = /\b(create|draft)\b/i.test(command);
-    if (isCreateOrDraft) {
-      if (typeof window !== "undefined") {
-        (window as any).__INITIAL_CHAT_PROMPT__ = command;
-        (window as any).__INITIAL_JURISDICTION__ = selectedJuri;
-      }
-      onNavigate("drafting");
-      return;
-    }
-
     setIsHomeAiRunning(true);
+
+    const outgoing = { sender: "user" as const, text: command };
+    setChatMessages(prev => [...prev, outgoing]);
 
     try {
       setWebGpuProgressText("Running Clausely local harness...");
       setWebGpuProgressVal(0.35);
 
+      const isDraftIntent = /\b(?:create|draft|generate|prepare|write|make|nda|contract|agreement|petition)\b/i.test(command);
       const result = await runClauselyAgent({
         input: command,
         surface: "home",
-        task: /\b(?:review|check|analy[sz]e)\b/i.test(command) ? "review_document" : "draft_document",
-        modelPreference: "minicpm5_local",
+        task: isDraftIntent ? "draft_document" : "chat",
+        modelPreference: isDraftIntent ? "minicpm5_local" : "gemma4_e2b_local",
         privacyMode: "local_only",
         context: {
           jurisdiction: selectedJuri,
@@ -206,36 +208,85 @@ export default function DashboardHome({ onNavigate }: DashboardHomeProps) {
           firmId: "firm_123",
         },
       });
-      const draftText = result.committedArtifacts.find(artifact => artifact.type === "document")?.text || "";
-      
-      // Store initial state for Drafting Studio to consume
-      if (typeof window !== "undefined") {
-        (window as any).__INITIAL_DRAFT__ = draftText;
-        (window as any).__INITIAL_JURISDICTION__ = selectedJuri;
-        (window as any).__INITIAL_CHAT_MESSAGES__ = [
-          { sender: "user", text: command },
-          { sender: "ai", text: result.response || "Draft compiled through the Clausely local harness." }
-        ];
+
+      let responseText = result.response;
+      let parsedJson: any = null;
+      try {
+        const cleanJsonText = responseText.replace(/```json/g, "").replace(/```/g, "").trim();
+        parsedJson = JSON.parse(cleanJsonText);
+      } catch (e) {
+        // Not a JSON block
+      }
+
+      if (parsedJson && parsedJson.action?.tool === "request_matter_setup" && !bypassModal) {
+        setPendingPrompt(command);
+        setNewMatterName(parsedJson.action.parameters.suggestedMatterName || "New Case");
+        setPartyA("");
+        setPartyB("");
+        
+        setChatMessages(prev => [
+          ...prev,
+          {
+            sender: "ai" as const,
+            text: parsedJson.reply || "I need to set up the case/matter details to proceed. Please complete the form below.",
+            thought: parsedJson.thought || "User requested document drafting. Matter details and party names must be set up.",
+            action: parsedJson.action
+          }
+        ]);
+      } else {
+        const finalReply = parsedJson ? parsedJson.reply : responseText;
+        const draftText = result.committedArtifacts.find(
+          artifact => artifact.type === "document" || artifact.type === "chat_response"
+        )?.text || "";
+
+        if (draftText) {
+          if (typeof window !== "undefined") {
+            (window as any).__INITIAL_DRAFT__ = draftText;
+            (window as any).__INITIAL_JURISDICTION__ = selectedJuri;
+            (window as any).__INITIAL_CHAT_MESSAGES__ = [
+              ...chatMessages,
+              outgoing,
+              { sender: "ai", text: finalReply }
+            ];
+          }
+          setWebGpuProgressText("");
+          setWebGpuProgressVal(0);
+          onNavigate("drafting");
+          return;
+        }
+
+        setChatMessages(prev => [
+          ...prev,
+          {
+            sender: "ai" as const,
+            text: finalReply,
+            thought: parsedJson?.thought || "Successfully processed user command."
+          }
+        ]);
       }
 
       setWebGpuProgressText("");
       setWebGpuProgressVal(0);
-      // Navigate to drafting studio
-      onNavigate("drafting");
     } catch (error) {
       console.error(error);
-      if (typeof window !== "undefined") {
-        (window as any).__INITIAL_CHAT_MESSAGES__ = [
-          { sender: "user", text: command },
-          { sender: "ai", text: "The Clausely local harness could not complete that command. Try a narrower drafting instruction." }
-        ];
-      }
-      setWebGpuProgressText("");
-      setWebGpuProgressVal(0);
-      onNavigate("drafting");
+      setChatMessages(prev => [
+        ...prev,
+        {
+          sender: "ai" as const,
+          text: "The local Clausely harness could not complete that command. Try a narrower instruction."
+        }
+      ]);
     } finally {
       setIsHomeAiRunning(false);
     }
+  };
+
+  const handleConfirmSetupInline = async (msg: any) => {
+    const matterTitle = isNewMatter ? (newMatterName.trim() || "New Matter Setup") : linkedMatter;
+    const finalPrompt = `${pendingPrompt} (Case/Matter: ${matterTitle}, Plaintiff/Party A: ${partyA || "Not Specified"}, Defendant/Party B: ${partyB || "Not Specified"})`;
+
+    setChatMessages(prev => prev.map(m => m.text === msg.text ? { ...m, action: null } : m));
+    await submitHomeAi(finalPrompt, true);
   };
 
   return (
@@ -368,6 +419,138 @@ export default function DashboardHome({ onNavigate }: DashboardHomeProps) {
             <h2 className="home-chat-greeting">Good morning, Manas 👋</h2>
             <p className="home-chat-subtitle">What are you drafting today?</p>
           </div>
+
+          {/* Chat Feed history */}
+          {chatMessages.length > 0 && (
+            <div className="flex flex-col gap-4 max-h-[350px] overflow-y-auto mb-4 p-4 bg-slate-100/50 dark:bg-black/25 border border-slate-200 dark:border-slate-800/80 rounded-3xl">
+              {chatMessages.map((msg, i) => (
+                <div key={i} className={`flex flex-col gap-2 max-w-[90%] ${
+                  msg.sender === "user" ? "ml-auto" : "mr-auto"
+                }`}>
+                  <div className={`p-4 rounded-2xl leading-relaxed text-xs shadow-sm ${
+                    msg.sender === "user" 
+                      ? "bg-blue-600 text-white" 
+                      : "bg-white dark:bg-[#11121a] text-slate-800 dark:text-slate-200 border border-slate-200 dark:border-slate-800/80"
+                  }`}>
+                    <span className="font-bold text-[10px] block mb-1 opacity-70">
+                      {msg.sender === "user" ? "You" : "Clausely AI"}
+                    </span>
+                    <p className="whitespace-pre-wrap">{msg.text}</p>
+                  </div>
+
+                  {/* Collapsible Thinking Process Accordion */}
+                  {msg.sender === "ai" && msg.thought && (
+                    <details className="bg-slate-100/50 dark:bg-white/5 border border-slate-200/50 dark:border-slate-800/40 rounded-xl overflow-hidden text-[10px] text-slate-500">
+                      <summary className="px-3 py-1.5 font-semibold cursor-pointer hover:bg-slate-200/40 dark:hover:bg-white/10 select-none flex items-center gap-1.5">
+                        <Sparkles className="h-3 w-3 text-blue-500 animate-pulse" />
+                        <span>Thinking Process</span>
+                      </summary>
+                      <div className="p-3 border-t border-slate-200/30 dark:border-slate-800/30 font-mono leading-relaxed whitespace-pre-wrap">
+                        {msg.thought}
+                      </div>
+                    </details>
+                  )}
+
+                  {/* Inline Matter & Parties setup form */}
+                  {msg.sender === "ai" && msg.action?.tool === "request_matter_setup" && (
+                    <div className="p-4 bg-white dark:bg-[#11121a] border border-slate-250 dark:border-slate-800 rounded-2xl space-y-4 text-xs text-slate-800 dark:text-slate-200 shadow-md">
+                      <div className="font-bold text-xs flex items-center gap-1.5 pb-2 border-b border-slate-100 dark:border-slate-800/60">
+                        <Sparkles className="h-3.5 w-3.5 text-blue-500" />
+                        Configure Document Setup
+                      </div>
+                      
+                      <div className="space-y-1.5">
+                        <label className="block text-[10px] font-bold text-slate-400 dark:text-slate-550 uppercase">Case Context</label>
+                        <div className="grid grid-cols-2 gap-2">
+                          <button 
+                            type="button"
+                            onClick={() => setIsNewMatter(true)}
+                            className={`py-2 rounded-xl border text-[11px] font-semibold transition-all cursor-pointer ${
+                              isNewMatter 
+                                ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400" 
+                                : "border-slate-200 dark:border-slate-800 text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-900"
+                            }`}
+                          >
+                            Create New Case
+                          </button>
+                          <button 
+                            type="button"
+                            onClick={() => setIsNewMatter(false)}
+                            className={`py-2 rounded-xl border text-[11px] font-semibold transition-all cursor-pointer ${
+                              !isNewMatter 
+                                ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400" 
+                                : "border-slate-200 dark:border-slate-800 text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-900"
+                            }`}
+                          >
+                            Link Existing
+                          </button>
+                        </div>
+                      </div>
+
+                      {isNewMatter ? (
+                        <div className="space-y-1">
+                          <label className="block text-[10px] font-bold text-slate-400 dark:text-slate-550">New Matter Name</label>
+                          <input 
+                            type="text" 
+                            value={newMatterName}
+                            onChange={(e) => setNewMatterName(e.target.value)}
+                            className="w-full bg-slate-50 dark:bg-[#1c1e27] border border-slate-200 dark:border-slate-800 rounded-xl px-3 py-2 outline-none text-xs text-slate-900 dark:text-white"
+                            placeholder="e.g. NDA for Client Alpha"
+                          />
+                        </div>
+                      ) : (
+                        <div className="space-y-1">
+                          <label className="block text-[10px] font-bold text-slate-400 dark:text-slate-555 font-sans">Link Matter</label>
+                          <select 
+                            value={linkedMatter}
+                            onChange={(e) => setLinkedMatter(e.target.value)}
+                            className="w-full bg-slate-50 dark:bg-[#1c1e27] border border-slate-200 dark:border-[#2d303f] rounded-xl px-3 py-2 outline-none text-xs text-slate-850 dark:text-white cursor-pointer"
+                          >
+                            <option value="ABC Corp vs State of Maharashtra">ABC Corp vs State of Maharashtra</option>
+                            <option value="Sharma Partition Dispute">Sharma Partition Dispute</option>
+                            <option value="TechNova vs InnovateX">TechNova vs InnovateX</option>
+                            <option value="R.K. Builders vs ICC">R.K. Builders vs ICC</option>
+                            <option value="Neha Verma Employee Dispute">Neha Verma Employee Dispute</option>
+                          </select>
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="space-y-1">
+                          <label className="block text-[10px] font-bold text-slate-400 dark:text-slate-550">Party A (Plaintiff)</label>
+                          <input 
+                            type="text" 
+                            value={partyA}
+                            onChange={(e) => setPartyA(e.target.value)}
+                            className="w-full bg-slate-50 dark:bg-[#1c1e27] border border-slate-200 dark:border-slate-800 rounded-xl px-3 py-2 outline-none text-xs text-slate-900 dark:text-white"
+                            placeholder="First Party name"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="block text-[10px] font-bold text-slate-400 dark:text-slate-550">Party B (Defendant)</label>
+                          <input 
+                            type="text" 
+                            value={partyB}
+                            onChange={(e) => setPartyB(e.target.value)}
+                            className="w-full bg-slate-50 dark:bg-[#1c1e27] border border-slate-200 dark:border-slate-800 rounded-xl px-3 py-2 outline-none text-xs text-slate-900 dark:text-white"
+                            placeholder="Second Party name"
+                          />
+                        </div>
+                      </div>
+
+                      <button 
+                        type="button"
+                        onClick={() => handleConfirmSetupInline(msg)}
+                        className="w-full py-2 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-xs cursor-pointer shadow-md hover:shadow-lg transition-all"
+                      >
+                        Confirm Setup & Draft
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
 
           <form
             className="home-chat-pill-form"
