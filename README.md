@@ -32,9 +32,9 @@ A browser-native stacked canvas that provides a premium document viewing and edi
 
 ## 🛠️ Tech Stack
 *   **Core:** React, Next.js (App Router), TypeScript, Tailwind CSS
-*   **AI Engine:** Google Gemini 3.5 Flash (Client-Side), Clausely Multi-Agent Harness (`src/agent/`)
+*   **AI Engine:** Google Gemma 4 E2B (Local Agent Planning), Google Gemma 4 E4B (Local Validation & Verification Agent), Google Gemini 3.5 Flash (Client-Side Document Chunking & Speech Engine)
 *   **APIs & Voice:** Web Speech API, SpeechSynthesis, Resend SMTP
-*   **Deployment:** Docker, Vercel
+*   **Deployment:** Docker, Firebase Hosting, Vercel
 
 ---
 
